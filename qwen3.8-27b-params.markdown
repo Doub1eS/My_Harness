@@ -180,3 +180,66 @@ aux 的关键取值:`base_url=http://localhost:8003/v1`、`model=qwen3.8-27b`、
 3. 起服务 → `curl /v1/models` 确认 `qwen3.8-27b` 就位,再跑 `demo_tool_call.py` 冒烟。
 4. 日志:`~/laser_rag/logs/qwen38_sglang.log`(起服务重定向)。排查 SIGTERM/吞吐/队列都在这里。
 5. 想验证长上下文:先不开 YaRN 跑 32768 冒烟;确实需要 >262K 再照 §1.4 开,并留意短文本退化。
+
+---
+
+## 7. Harness 要盯的其它 Qwen 参数(除上下文外)
+
+> 上下文(§1.3)只是第一项。做多智能体编排时,下面这些直接影响**每轮行为、上下文预算、成本、门禁稳定性**。分四组:thinking 控制 / 采样确定性 / 结构化输出 / 引擎吞吐。每项标了"harness 场景 / 当前状态 / 建议"。
+
+### 7.1 Thinking 的细粒度控制(最影响预算和时延)
+
+| 参数 | 取值 | harness 场景 | 当前状态 | 建议 |
+|---|---|---|---|---|
+| `enable_thinking` | true/false | 协调者路由/判型开;快问快答子调用关 | 逐请求可开可关(`extra_body.chat_template_kwargs`) | 默认开,按角色粒度开关 |
+| `preserve_thinking` | true/false | thinking 历史**默认全保留**——多轮工具循环里每轮 thinking 都留在上下文 | 官方默认 **true**;`chat_template_kwargs.preserve_thinking=false` 可关 | 长任务若上下文吃紧,对不需要推理记忆的专家关掉,能省一大截预算 |
+| `reasoning_effort` | **xhigh / medium / low** | 调推理深度/成本 | 模型官方支持;**但当前 SGLang auto-detect `effort_kwarg=None`**,逐请求设未必生效 | 别依赖它做节流;先实测 `xhigh/medium` 是否有差别,没差别就用 thinking 开关代替 |
+
+**为什么 preserve_thinking 在 harness 里是重点**:默认它把**每一轮**的 reasoning 都追加回 messages。你的 run_tools 循环跑 3–4 轮 → 一轮 deep thinking 可能就几千 token 留在历史里 → 很快吃掉 32K。这也是上一版"8K 很紧"直觉的来源——**真正吃上下文的是 thinking 历史,不是对话本身**。
+
+### 7.2 采样确定性(门禁/Gate 稳定性)
+
+| 参数 | 取值 | harness 场景 | 建议 |
+|---|---|---|---|
+| `temperature` | 0–2 | 工具调用/结构化产出要**可复现** | 工具循环 `temperature=0`;但注意 GPT 风格 temp≠纯贪心,Qwen 下仍可能采样 |
+| `top_p` / `top_k` | 0.95 / 20(默认) | 内容生成多样性 | 一般不动;工具循环可 `top_p=1, top_k=-1` 尽量去随机化 |
+| `max_tokens` | — | 每轮输出预算,`max_tokens` 设太小 thinking 可能被截断 | thinking 开着时把输出预算给足(见 3.3);截断的 reasoning 会污染下一轮 |
+
+**对 harness 的实际含义**:Gate 用自动校验(必填项/JSON schema)会比"让模型保证格式"可靠。确定性参数是辅助,不该当门禁本身。
+
+### 7.3 结构化输出(直接喂给 Gate / Spec 文件)
+
+| 项 | 说明 |
+|---|---|
+| 语法后端 | SGLang 这个启动的 `grammar_backend='xgrammar'`(日志 server_args 确认) |
+| 用途 | 让专家 Agent 直接产出**符合 schema 的 JSON**(如 spec 文件、工具入参),而不是靠提示词"请输出 JSON"再抽 |
+| 当前状态 | 引擎已带 xgrammar;还没在 harness 里用 |
+| 建议 | 阶段 3 做 Gate 时,配合 OpenAI `response_format={"type":"json_schema", ...}` 或工具入参约束,能显著减少"模型给的 JSON 抽不出来"类故障——这正好对应 requirements 里"SQL 语法校验"那类自动门禁 |
+
+### 7.4 引擎吞吐与并发(多专家并行时)
+
+| 参数 | 实测/默认 | harness 场景 | 建议 |
+|---|---|---|---|
+| `chunked-prefill-size` | 8192 | 长 prompt(角色文件+历史+工具结果)分块预填,避免大请求占满 | 保持默认;prompt 超 8K 会自动分块 |
+| `max_running_requests` | None(未设) | 协调者派多个专家并行时的队列行为 | 阶段 2 做并行前先压测:几个并发请求时吞吐怎么掉 |
+| 单请求吞吐 | ~7.9 token/s(full,thinking) | 一个长任务=几十秒~几分钟 | 预算耗时;并行专家是"总吞吐换单请求时延" |
+| 前缀缓存 | 引擎默认开启(radix cache) | 多个专家共享**同一段 system prompt/角色前缀**时可复用 KV | **把公共约束(红线+身份)放 system 最前且字节级一致**,专家越多省得越多——这也是"角色文件复用"的一个隐藏收益 |
+
+### 7.5 一份"harness 每次调用都该显式带上"的清单(建议模板)
+
+```python
+client.chat.completions.create(
+    model="qwen3.8-27b",
+    messages=...,                      # 顺序:共享红线+身份 → 阶段上下文 → 本轮
+    temperature=0.0,                   # 工具循环;开放生成再改 0.3
+    max_tokens=4096,                   # thinking 开着要留足
+    extra_body={"chat_template_kwargs": {
+        "enable_thinking": True,        # 按角色开关
+        # "preserve_thinking": False,   # 上下文吃紧时按专家关
+    }},
+    # tools=..., tool_choice="auto",   # 阶段 0 起
+    # response_format={"type": "json_schema", ...}   # 阶段 3 Gate 起
+)
+```
+
+> 原则:**能默认的别每次都传,会变的分角色传**。上面只有 `temperature`/`max_tokens`/`enable_thinking`/`preserve_thinking` 是按调用变化的,其余由起服务参数与代码模板固定。
